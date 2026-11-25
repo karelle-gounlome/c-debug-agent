@@ -11,6 +11,29 @@ MAX_STEPS = 8
 TARGET = "bugs/compile_error/main.c"
 
 
+# ---------- Sandbox ----------
+
+SANDBOX_IMAGE = "c-sandbox"
+
+
+def sandbox_run(path, command):
+    """Run a shell command inside the Docker sandbox.
+
+    The folder of 'path' is mounted read-only in /work.
+    No network, limited memory, CPU and number of processes.
+    """
+    folder = os.path.abspath(os.path.dirname(path))
+    return subprocess.run(
+        ["docker", "run", "--rm",
+         "--network", "none",
+         "--memory", "256m",
+         "--cpus", "1",
+         "--pids-limit", "64",
+         "-v", folder + ":/work:ro",
+         SANDBOX_IMAGE, "sh", "-c", command],
+        capture_output=True, text=True, timeout=60)
+
+
 # ---------- Tools ----------
 
 def compile_c(path: str) -> str:
@@ -19,8 +42,8 @@ def compile_c(path: str) -> str:
     Args:
         path: path of the .c file to compile
     """
-    r = subprocess.run(["gcc", "-Wall", "-Wextra", "-o", "/tmp/a.out", path],
-                       capture_output=True, text=True, timeout=30)
+    name = os.path.basename(path)
+    r = sandbox_run(path, "gcc -Wall -Wextra -o /tmp/a.out " + name)
     if r.returncode == 0:
         return "Compilation succeeded."
     return r.stderr
@@ -40,7 +63,12 @@ def run_test(path: str) -> str:
     with open(expected_file) as f:
         expected = f.read()
 
-    r = subprocess.run(["/tmp/a.out"], capture_output=True, text=True, timeout=10)
+    # Compile and run in the same container: the binary is lost when it stops.
+    # 'timeout 10' stops programs that run forever.
+    name = os.path.basename(path)
+    r = sandbox_run(path, "gcc -o /tmp/a.out " + name + " && timeout 10 /tmp/a.out")
+    if r.returncode == 124:
+        return "TEST FAILED: the program ran for more than 10 seconds"
     if r.stdout == expected:
         return "TEST PASSED"
     return "TEST FAILED: expected " + repr(expected) + ", got " + repr(r.stdout)

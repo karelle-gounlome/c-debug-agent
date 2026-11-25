@@ -40,3 +40,27 @@ The problem is malformed tool calls:
 
 - Try a bigger model (llama3.1:8b), better at tool call formats.
 - Add a replace_line tool for small, targeted edits.
+
+
+## Experiment: Docker sandbox
+
+compile_c and run_test now run inside a Docker container (image c-sandbox):
+no network, 256 MB memory, 1 CPU, 64 processes, folder mounted read-only,
+programs stopped after 10 seconds.
+
+| Run | Model        | Result | Steps | Bad arguments |
+|-----|--------------|--------|-------|---------------|
+| 1   | llama3.1:8b  | PASSED | 4     | 1             |
+| 2   | llama3.1:8b  | PASSED | 4     | 0             |
+| 3   | llama3.1:8b  | PASSED | 5     | 1             |
+| 4   | llama3.1:8b  | PASSED | 6     | 1             |
+
+Success rate: 4/4 (100%). Average steps: 4.75.
+The sandbox did not reduce reliability.
+
+Observations:
+- In run 4 the agent also rewrote line 6, which was correct.
+  The test passed, but the fix was not minimal.
+  Idea: also measure the number of changed lines.
+- The agent always loses the indentation of the lines it replaces.
+  Idea: replace_line could keep the original indentation automatically.

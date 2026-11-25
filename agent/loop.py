@@ -1,11 +1,17 @@
+import inspect
+import json
 import os
+import re
 import subprocess
 import ollama
 
-MODEL = "llama3.2:3b"
+# Model can be changed without editing the code: MODEL=llama3.1:8b python agent/loop.py
+MODEL = os.environ.get("MODEL", "llama3.2:3b")
 MAX_STEPS = 8
 TARGET = "bugs/compile_error/main.c"
 
+
+# ---------- Tools ----------
 
 def compile_c(path: str) -> str:
     """Compile a C file with gcc. Return the errors, or 'Compilation succeeded.'.
@@ -41,44 +47,93 @@ def run_test(path: str) -> str:
 
 
 def read_file(path: str) -> str:
-    """Return the full content of a file.
+    """Return the content of a file, with line numbers.
 
     Args:
         path: path of the file to read
     """
     with open(path) as f:
-        return f.read()
+        lines = f.read().split("\n")
+    return "\n".join(str(i) + ": " + line for i, line in enumerate(lines, start=1))
 
 
-def write_file(path: str, content: str) -> str:
-    """Replace the full content of a .c file with the fixed code.
+def replace_line(path: str, line: int, new_content: str) -> str:
+    """Replace one line of a .c file. Lines are numbered from 1.
 
     Args:
-        path: path of the .c file to write
-        content: new full content of the file
+        path: path of the .c file to modify
+        line: number of the line to replace (the first line is 1)
+        new_content: new content of the line, without the line number
     """
     # Guard: the agent may only modify .c files, never the expected output
     if not path.endswith(".c"):
-        return "Error: you can only write .c files."
+        return "Error: you can only modify .c files."
+    line = int(line)
+    with open(path) as f:
+        lines = f.read().split("\n")
+    if line < 1 or line > len(lines):
+        return "Error: line must be between 1 and " + str(len(lines)) + "."
+    lines[line - 1] = new_content
     with open(path, "w") as f:
-        f.write(content)
-    return "File written."
+        f.write("\n".join(lines))
+    return "Line " + str(line) + " replaced."
 
 
 TOOLS = {
     "compile_c": compile_c,
     "run_test": run_test,
     "read_file": read_file,
-    "write_file": write_file,
+    "replace_line": replace_line,
 }
+
+
+# ---------- Helpers ----------
+
+def run_tool(name, args):
+    """Run a tool by name. Any error is returned as text, never raised."""
+    fn = TOOLS.get(name)
+    if fn is None:
+        return "Unknown tool: " + name + ". Available tools: " + ", ".join(TOOLS) + "."
+    try:
+        return fn(**args)
+    except TypeError as e:
+        # Wrong arguments: tell the agent the correct argument names
+        params = ", ".join(inspect.signature(fn).parameters)
+        return "Error: " + str(e) + ". The arguments of " + name + " are: " + params + "."
+    except Exception as e:
+        return "Error: " + str(e)
+
+
+def parse_text_tool_call(text):
+    """Look for a tool call written as JSON inside a text answer.
+
+    Return (name, args) if a valid call is found,
+    ("", None) if a call is found but its JSON is invalid,
+    None if there is no call in the text.
+    """
+    match = re.search(r'\{\s*"name"', text)
+    if match is None:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[match.start():])
+    except json.JSONDecodeError:
+        return ("", None)
+    name = obj.get("name", "")
+    args = obj.get("parameters", obj.get("arguments"))
+    if not isinstance(name, str) or not isinstance(args, dict):
+        return ("", None)
+    return (name, args)
+
+
+# ---------- Agent loop ----------
 
 messages = [
     {"role": "system", "content":
         "You are an agent that fixes C programs. "
         "Do one action at a time. Method: "
-        "1) run_test to see the error, "
-        "2) read_file to see the code, "
-        "3) write_file with the fixed code, "
+        "1) run_test to see the error and its line number, "
+        "2) read_file to see the code with line numbers, "
+        "3) replace_line to fix only the wrong line, "
         "4) run_test again. "
         "Make the smallest possible fix. Never remove existing functionality. "
         "Stop only when the result is TEST PASSED."},
@@ -88,34 +143,36 @@ messages = [
 for step in range(1, MAX_STEPS + 1):
     r = ollama.chat(model=MODEL, messages=messages, tools=list(TOOLS.values()))
     messages.append(r.message)
+    text = r.message.content or ""
 
-    if not r.message.tool_calls:
-        status = run_test(TARGET)
-        if status == "TEST PASSED":
-            print("Agent stopped:", r.message.content)
-            break
-        # The agent wants to stop but the test fails: push it back to work
-        print("Agent tried to stop, but:", status.splitlines()[0])
-        messages.append({"role": "user", "content":
-            "The test still fails. Do not answer with text. "
-            "Call one of the tools: run_test, read_file, write_file."})
-        continue
-
-    for call in r.message.tool_calls:
-        name = call.function.name
-        args = call.function.arguments
-        print("[step", step, "]", name, str(args)[:80])
-
-        fn = TOOLS.get(name)
-        if fn is None:
-            output = "Unknown tool: " + name
+    if r.message.tool_calls:
+        calls = [(c.function.name, c.function.arguments) for c in r.message.tool_calls]
+    else:
+        parsed = parse_text_tool_call(text)
+        if parsed is not None and parsed[1] is not None:
+            # The agent wrote a valid tool call as text: run it anyway
+            print("    (tool call found in text)")
+            calls = [parsed]
         else:
-            try:
-                output = fn(**args)
-            except Exception as e:
-                # A tool error becomes an observation for the agent, not a crash
-                output = "Error: " + str(e)
+            status = run_test(TARGET)
+            if status == "TEST PASSED":
+                print("Agent stopped:", text)
+                break
+            # The agent wants to stop but the test fails: push it back to work
+            print("Agent tried to stop, but:", status.splitlines()[0])
+            print("    agent said:", text[:200])
+            if parsed is not None:
+                hint = ("Your tool call written as text is not valid JSON. "
+                        "Use a real tool call instead of text.")
+            else:
+                hint = ("The test still fails. Do not answer with text. "
+                        "Call one of the tools: run_test, read_file, replace_line.")
+            messages.append({"role": "user", "content": hint})
+            continue
 
+    for name, args in calls:
+        print("[step", step, "]", name, str(args)[:80])
+        output = run_tool(name, args)
         print("    result:", output[:150])
         messages.append({"role": "tool", "content": output, "tool_name": name})
 
